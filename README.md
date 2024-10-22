@@ -1,6 +1,6 @@
 # AuthStager
 
-**AuthStager** is a proof-of-concept tool that generates a custom stager shellcode with request authentication. The stager validates client requests before downloading the second stage, enhancing security in the staging process. The detailed information regarding this project is explained at this blogpost: [Stage, But Verify](https://hulkops.gitbook.io/blog/red-team/stage-but-verify)
+**AuthStager** is a proof-of-concept tool that generates a custom stager shellcode that authenticates to the stager server using an authentication token. The server validates client requests before sending the second stage, enhancing security in the staging process. The detailed information regarding this project is explained in this blog post: [Stage, But Verify](https://hulkops.gitbook.io/blog/red-team/stage-but-verify)
 
 ## Features
 - Generates stager shellcode with request authentication.
