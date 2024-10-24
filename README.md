@@ -35,7 +35,7 @@ python3 generate_stager.py -f <path-to-payload> -H <C2 IP> -s <port> -t <token c
 ```
 - `-f`: Path to the payload (e.g., /tmp/havoc.bin).
 - `-H`: Command and Control (C2) server IP address or Domain.
-- `-s`: Port on which the C2 server listens (default: 80).
+- `-s`: Port on which the server should listen (default: 80).
 - `-d`: Sacrificial DLL for Stomping (default: C:\Windows\System32\chakra.dll)
 - `-t`: Number of times the payload can authenticate (default: 1, Max: 5).
 - `-x`: Output format ('c' for C code, 'raw' for bin file)
